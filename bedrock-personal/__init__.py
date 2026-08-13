@@ -1,16 +1,16 @@
-"""Bedrock via Sam's PERSONAL ALPHA account — the third access path.
+"""Bedrock via a personal AWS account — the third access path.
 
-Surfaces Claude (Converse) on account 333843746513, role
-``IibsAdminAccess-DO-NOT-DELETE``, so the model picker can express "run this on
-my own account" alongside the two internal ones:
+Surfaces Claude (Converse) on a personal account rather than an Amazon-internal
+one, so the model picker can express "run this on my own account" alongside the
+two internal paths:
 
-===================  ==============================  =============  =========
-provider             path                            account        region
-===================  ==============================  =============  =========
-``bedrock-mantle``   internal GPT (Responses API)    493765493388   us-east-2
-``bedrock``          internal Claude (Converse)      175342148895   us-west-2
-``bedrock-personal`` **personal Claude (Converse)**  333843746513   us-east-1
-===================  ==============================  =============  =========
+===================  ==============================  ===================  =========
+provider             path                            credential           region
+===================  ==============================  ===================  =========
+``bedrock-mantle``   internal GPT (Responses API)    codex profile        us-east-2
+``bedrock``          internal Claude (Converse)      claude-code profile  us-west-2
+``bedrock-personal`` **personal Claude (Converse)**  personal profile     us-east-1
+===================  ==============================  ===================  =========
 
 Why us-east-1 and not us-west-2
 -------------------------------
@@ -23,20 +23,20 @@ and whichever warmed it first would silently bill both paths.
 The accounts differ in regional reach, which supplies a natural cache key
 (verified 2026-08-04):
 
-* ``claude-code-DO-NOT-DELETE`` -> us-west-2 works, us-east-1
+* the claude-code profile -> us-west-2 works, us-east-1
   ``AccessDeniedException``.
-* ``claude`` (personal) -> us-west-2, **us-east-1** and us-east-2 all work.
+* the personal profile -> us-west-2, **us-east-1** and us-east-2 all work.
 
 Pinning personal traffic to us-east-1 therefore gives each account its own
-cache slot with no core patch. ``us.anthropic.claude-{opus-5,sonnet-5,fable-5}``
-were each confirmed to return a real completion there.
+cache slot with no core patch. The current Claude releases were each confirmed
+to return a real completion there.
 
 Credential handling
 -------------------
 ``AWS_PROFILE`` is process-global and the sibling ``bedrock`` plugin force-sets
 it to the claude-code role at import time. This module therefore does **not**
 set it at import; it patches ``boto3.client`` to bind the personal profile to
-clients built for its own region only. That keeps three accounts alive in one
+clients built for its own region only. That keeps several accounts alive in one
 WebUI process.
 """
 
@@ -58,11 +58,12 @@ _spec = importlib.util.spec_from_file_location(
 _acct = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_acct)
 
-PROFILE = _acct.PERSONAL_PROFILE          # "claude"
-ACCOUNT = _acct.PERSONAL_ACCOUNT          # 333843746513
+PROFILE = _acct.PERSONAL_PROFILE          # local AWS config profile name
 REGION = _acct.PERSONAL_REGION            # us-east-1
 BASE_URL = f"https://bedrock-runtime.{REGION}.amazonaws.com"
-MODELS = list(_acct.CLAUDE_MODELS)
+# Seed catalog. Real ids come from the shared reducer applied to discovery; this
+# only backstops a failed discovery call, so it names long-public models.
+MODELS = list(_acct.CLAUDE_SEED_MODELS)
 
 
 def _install_region_scoped_profile_patch() -> bool:
@@ -168,7 +169,7 @@ _install_patch_when_boto3_arrives()
 
 
 class PersonalBedrockProfile(ProviderProfile):
-    """Claude on Bedrock via the personal ALPHA account."""
+    """Claude on Bedrock via a personal AWS account."""
 
     def fetch_models(
         self,
@@ -189,9 +190,9 @@ class PersonalBedrockProfile(ProviderProfile):
 bedrock_personal = PersonalBedrockProfile(
     name="bedrock-personal",
     aliases=("bedrock-alpha", "claude-personal", "personal-bedrock", "my-bedrock"),
-    display_name="Bedrock: Personal Claude (my ALPHA acct)",
+    display_name="Bedrock: Personal Claude (my own acct)",
     description=(
-        f"Claude on Bedrock via my own account {ACCOUNT} ({REGION}, IAM auth) — "
+        f"Claude on Bedrock via my own AWS account ({REGION}, IAM auth) — "
         "billed to me; use when the internal accounts are throttled or denied"
     ),
     api_mode="bedrock_converse",

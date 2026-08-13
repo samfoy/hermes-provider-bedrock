@@ -46,28 +46,32 @@ Use it:
 hermes -z "hello" --provider bedrock-mantle -m openai.gpt-5.6-sol
 ```
 
-## The three Bedrock accounts — they are not interchangeable
+## The Bedrock accounts — they are not interchangeable
 
 Amazon vends a **separate account per tool**, and each is authorized for a
 different model family. Verified 2026-08-04:
 
-| Profile | Account | Role | Mantle GPT inference | Claude on Bedrock |
-|---|---|---|---|---|
-| `codex-DO-NOT-DELETE` | 493765493388 | `CaminusBedrockAccess` | **✅** | ✅ |
-| `claude-code-DO-NOT-DELETE` | 175342148895 | `CeceliaAmazonInternal` | ❌ `CreateInference` denied | ✅ |
-| `claude` (personal ALPHA) | 333843746513 | `IibsAdminAccess` | ✅ | ✅ |
+| Profile | Mantle GPT inference | Claude on Bedrock |
+|---|---|---|
+| codex (GPT-provisioned) | **✅** | ✅ |
+| claude-code (Claude-provisioned) | ❌ `CreateInference` denied | ✅ |
+| personal | ✅ | ✅ |
 
 Consequences worth knowing:
 
-* **`claude-code-DO-NOT-DELETE` cannot serve GPT at all** — `bedrock-mantle:CreateInference`
+* **The claude-code profile cannot serve GPT at all** — `bedrock-mantle:CreateInference`
   is explicitly denied. This is the same class of failure the codex docs
   describe under *"Unauthorized with explicit deny in service control policy"*.
-* **The codex account is denied `bedrock-mantle:ListModels` but allowed
+* **The codex profile is denied `bedrock-mantle:ListModels` but allowed
   `CreateInference`.** Discovery 401s while inference succeeds, which is why
   `fetch_models()` returns a curated list — a discovery-based catalog would
-  report zero models on a perfectly working account.
-* **The personal account works for both but bills the user's own ALPHA account.**
-  Prefer the purpose-built codex account for GPT traffic.
+  report zero models on a perfectly working account. Never conclude a profile
+  lacks Mantle access from a failed `ListModels`; test a real completion.
+* **The personal profile works for both but bills the user personally.**
+  Prefer the purpose-built codex profile for GPT traffic.
+
+Profile names are whatever the local AWS config calls them. Set
+`HERMES_MANTLE_AWS_PROFILE` to point at your own.
 
 ### Environment variables
 

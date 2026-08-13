@@ -1,26 +1,31 @@
-"""Shared helpers for the three Amazon Bedrock access paths.
+"""Shared helpers for the Bedrock access paths.
 
 Amazon vends a **separate AWS account per tool**, and they are not
-interchangeable. Verified 2026-08-04:
+interchangeable. One account cannot serve GPT at all, so the provider split is an
+entitlement boundary rather than a preference:
 
-===========================  ============  =====================  ==========  ======
-profile                      account       role                   Mantle GPT  Claude
-===========================  ============  =====================  ==========  ======
-``codex-DO-NOT-DELETE``      493765493388  CaminusBedrockAccess   yes         yes
-``claude-code-DO-NOT-DELETE``175342148895  CeceliaAmazonInternal  **denied**  yes
-``claude`` (personal ALPHA)  333843746513  IibsAdminAccess        yes         yes
-===========================  ============  =====================  ==========  ======
+===========================  ====================  ==========  ======
+profile                      capability            GPT         Claude
+===========================  ====================  ==========  ======
+codex profile                GPT + Claude          yes         yes
+claude-code profile          Claude only           **denied**  yes
+personal profile             GPT + Claude          yes         yes
+===========================  ====================  ==========  ======
 
-Hermes surfaces these as four providers so the model picker can express which
-account a request bills to:
+Account numbers are deliberately not recorded here. Each profile resolves to its
+own account through the local AWS config, and :func:`account_id_for_profile`
+reports it at runtime when a diagnostic needs it.
+
+Providers surfaced, so the model picker can express which account a request bills
+to:
 
 ==========================  ==================================  ===================
 provider                    path                                credential
 ==========================  ==================================  ===================
-``bedrock-mantle``          internal GPT (Responses API)        codex account
-``bedrock``                 internal Claude (Converse)          claude-code account
-``bedrock-personal``        personal Claude (Converse)          personal account
-``bedrock-mantle-personal`` personal GPT (Responses API)        personal account
+``bedrock-mantle``          internal GPT (Responses API)        codex profile
+``bedrock``                 internal Claude (Converse)          claude-code profile
+``bedrock-personal``        personal Claude (Converse)          personal profile
+``bedrock-mantle-personal`` personal GPT (Responses API)        personal profile
 ==========================  ==================================  ===================
 
 The region-collision problem
@@ -33,9 +38,9 @@ both.
 
 The accounts differ in regional reach, which supplies a natural key:
 
-* ``claude-code-DO-NOT-DELETE`` works in **us-west-2 only** — us-east-1 returns
+* the claude-code profile works in **us-west-2 only** — us-east-1 returns
   ``AccessDeniedException``.
-* the personal ``claude`` account works in us-west-2, **us-east-1** and us-east-2.
+* the personal profile works in us-west-2, **us-east-1** and us-east-2.
 
 So internal Claude stays on us-west-2 and personal Claude is pinned to
 us-east-1. Different region -> different cache slot -> no credential bleed,
@@ -43,20 +48,29 @@ without patching core.
 
 ``AWS_PROFILE`` is still process-global, so it is applied per request rather
 than at import time; see :func:`profile_env_for_provider`.
+
+Model catalog policy
+--------------------
+Model ids are **discovered, never hardcoded**. ``latest_per_family`` reduces a
+discovered list to the newest release per family and orders families by
+capability, so a newly entitled model appears with no edit here and an
+unreleased model name never has to be written down. :data:`CLAUDE_SEED_MODELS`
+is a last-resort seed for the case where discovery cannot run at all; it names
+only long-public models.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 
-# ── Account map ─────────────────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
+
+# ── Profiles ────────────────────────────────────────────────────────────────
+# Names of local AWS config profiles, not account identifiers.
 CODEX_PROFILE = "codex-DO-NOT-DELETE"
 CLAUDE_CODE_PROFILE = "claude-code-DO-NOT-DELETE"
 PERSONAL_PROFILE = "claude"
-
-CODEX_ACCOUNT = "493765493388"
-CLAUDE_CODE_ACCOUNT = "175342148895"
-PERSONAL_ACCOUNT = "333843746513"
 
 # ── Regions ─────────────────────────────────────────────────────────────────
 # Internal Claude is only entitled in us-west-2.
@@ -66,40 +80,49 @@ PERSONAL_REGION = "us-east-1"
 # Mantle GPT is served from us-east-2.
 MANTLE_REGION = "us-east-2"
 
-# User-Agent required by the CeceliaAmazonInternal IAM condition on the
-# claude-code account. Streaming 403s without the `claude-cli/` prefix.
+# User-Agent required by an IAM condition on the claude-code profile.
+# Streaming 403s without the `claude-cli/` prefix.
 CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.131 (external, sdk-cli)"
 
-# ── Claude model catalog (Bedrock inference profiles) ───────────────────────
-# Both Claude accounts expose an identical 25-entry list; verified via
-# `aws bedrock list-inference-profiles` on each.
-#
-# Reduced to the LATEST of each family (see latest_per_family). Discovery still
-# runs and is filtered through the same reducer, so a newly released
-# `us.anthropic.claude-opus-6` appears without editing this file.
-CLAUDE_MODELS = [
-    "us.anthropic.claude-opus-5",
-    "us.anthropic.claude-sonnet-5",
-    "us.anthropic.claude-fable-5",
+# ── Claude model catalog ────────────────────────────────────────────────────
+# Seed only. Discovery through `list_inference_profiles` is the real source, and
+# it is filtered through `latest_per_family` below. This list exists so a failed
+# discovery call still yields a usable picker, so it names only long-public
+# models rather than whatever the account is currently entitled to.
+CLAUDE_SEED_MODELS = [
+    "us.anthropic.claude-opus-4-1-20250805-v1:0",
+    "us.anthropic.claude-sonnet-4-20250514-v1:0",
     "us.anthropic.claude-haiku-4-5-20251001-v1:0",
 ]
 
-# Family display order in the picker (most capable first).
-CLAUDE_FAMILY_ORDER = ["opus", "sonnet", "fable", "haiku"]
+# Backwards-compatible alias: callers historically imported CLAUDE_MODELS.
+CLAUDE_MODELS = CLAUDE_SEED_MODELS
 
-# Max output tokens per Claude model, verified empirically against Converse.
-CLAUDE_MAX_OUTPUT = {
-    "us.anthropic.claude-opus-5": 128000,
-    "us.anthropic.claude-sonnet-5": 128000,
-    "us.anthropic.claude-fable-5": 64000,
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0": 64000,
+# Relative capability of each Claude family, highest first. Ordering is by tier,
+# not by name, so an unlisted family sorts on its own merits instead of being
+# dropped to the bottom. Anthropic's naming is stable at the tier level even
+# when individual release names are not public.
+_FAMILY_TIER = {
+    "opus": 0,      # most capable
+    "sonnet": 2,    # mid
+    "haiku": 4,     # fastest / cheapest
 }
+# A family absent from the map lands between opus and sonnet: an unrecognised
+# family is far more likely to be a new flagship than a new cheap tier, and
+# burying a model the account is entitled to is the worse failure. This is what
+# keeps unreleased families out of the source while still ranking them sensibly.
+_UNKNOWN_FAMILY_TIER = 1
 
 _CLAUDE_ID_RE = re.compile(
     r"^(?P<prefix>us|global|eu|ap)\.anthropic\.claude-"
-    r"(?:(?P<legacy>3(?:-5|-7)?)-(?P<legacyfam>opus|sonnet|haiku)"
-    r"|(?P<family>opus|sonnet|haiku|fable)-(?P<ver>[0-9]+(?:-[0-9]+)?))"
+    r"(?:(?P<legacy>3(?:-5|-7)?)-(?P<legacyfam>[a-z]+)"
+    r"|(?P<family>[a-z]+)-(?P<ver>[0-9]+(?:-[0-9]+)?))"
 )
+
+
+def family_tier(family: str) -> int:
+    """Capability tier for a Claude family name. Lower sorts first."""
+    return _FAMILY_TIER.get(family, _UNKNOWN_FAMILY_TIER)
 
 
 def claude_family_and_version(model_id: str):
@@ -111,6 +134,11 @@ def claude_family_and_version(model_id: str):
     A trailing date/revision (``-20251001-v1:0``) is deliberately ignored: it
     is a build stamp, not a version, and two ids differing only by stamp are
     the same model release.
+
+    The family group is an open character class rather than a fixed alternation.
+    A fixed list silently drops any family it does not name, which both hides
+    models the account is entitled to and forces unreleased names into this
+    file.
     """
     m = _CLAUDE_ID_RE.match(str(model_id or ""))
     if not m:
@@ -125,12 +153,15 @@ def claude_family_and_version(model_id: str):
 
 
 def latest_per_family(model_ids):
-    """Keep only the highest-versioned id per Claude family, ordered sensibly.
+    """Keep only the highest-versioned id per Claude family, best first.
 
     Why this exists: ``list_inference_profiles`` returns every generation ever
-    entitled to the account — 13 ``us.anthropic.*`` ids covering opus 4.1
-    through 5, three sonnet generations, and Claude 3 haiku/sonnet from 2024.
-    A picker that long buries the model you actually want.
+    entitled to the account — opus 4.1 through 5, three sonnet generations, and
+    Claude 3 haiku/sonnet from 2024. A picker that long buries the model you
+    actually want.
+
+    Ordering is derived from :func:`family_tier` and the version number, so no
+    model id has to be named here to rank correctly.
 
     Unparseable ids are dropped rather than kept: everything reaching this
     function is an ``us.anthropic.claude-*`` inference profile, so a
@@ -147,11 +178,10 @@ def latest_per_family(model_ids):
             best[family] = version
             chosen[family] = mid
 
-    def sort_key(family: str) -> int:
-        try:
-            return CLAUDE_FAMILY_ORDER.index(family)
-        except ValueError:
-            return len(CLAUDE_FAMILY_ORDER)
+    # Sort by capability tier, then newest version first within a tier, then id
+    # for a stable result.
+    def sort_key(family: str):
+        return (family_tier(family), tuple(-p for p in best[family]), chosen[family])
 
     return [chosen[f] for f in sorted(chosen, key=sort_key)]
 
@@ -159,7 +189,7 @@ def latest_per_family(model_ids):
 def profile_env_for_provider(provider: str) -> dict:
     """Return the ``AWS_*`` env overrides a provider's requests must run under.
 
-    Returned as a dict rather than applied at import time on purpose: three
+    Returned as a dict rather than applied at import time on purpose: several
     providers coexist in one WebUI process, so a module-level
     ``os.environ["AWS_PROFILE"] = ...`` would let whichever plugin imported
     last decide the account for everybody.
@@ -179,11 +209,27 @@ def profile_env_for_provider(provider: str) -> dict:
     }
 
 
+def account_id_for_profile(profile: str) -> str | None:
+    """Resolve a profile's AWS account id at runtime, or None.
+
+    Exists so diagnostics can report which account a request bills to without
+    account numbers being committed to source. Never raises, and never blocks
+    startup: callers treat None as "unknown".
+    """
+    try:
+        import boto3
+
+        session = boto3.Session(profile_name=profile)
+        return session.client("sts").get_caller_identity().get("Account")
+    except Exception:
+        logger.debug("could not resolve account id for profile %r", profile, exc_info=True)
+        return None
+
+
 __all__ = [
     "CODEX_PROFILE", "CLAUDE_CODE_PROFILE", "PERSONAL_PROFILE",
-    "CODEX_ACCOUNT", "CLAUDE_CODE_ACCOUNT", "PERSONAL_ACCOUNT",
     "CLAUDE_CODE_REGION", "PERSONAL_REGION", "MANTLE_REGION",
-    "CLAUDE_CLI_USER_AGENT", "CLAUDE_MODELS", "CLAUDE_MAX_OUTPUT",
-    "CLAUDE_FAMILY_ORDER", "claude_family_and_version", "latest_per_family",
-    "profile_env_for_provider",
+    "CLAUDE_CLI_USER_AGENT", "CLAUDE_SEED_MODELS", "CLAUDE_MODELS",
+    "family_tier", "claude_family_and_version", "latest_per_family",
+    "profile_env_for_provider", "account_id_for_profile",
 ]

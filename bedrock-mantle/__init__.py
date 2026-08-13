@@ -63,23 +63,23 @@ REGION = os.environ.get("HERMES_MANTLE_REGION") or DEFAULT_REGION
 
 # Which AWS profile signs the requests.
 #
-# Amazon vends THREE separate Bedrock accounts, one per tool, and they are not
-# interchangeable (verified 2026-08-04, see README for the full matrix):
+# Amazon vends separate Bedrock accounts, one per tool, and they are not
+# interchangeable (verified 2026-08-04, see README for the capability matrix):
 #
-#   codex-DO-NOT-DELETE        493765493388  CaminusBedrockAccess   <- GPT models
-#   claude-code-DO-NOT-DELETE  175342148895  CeceliaAmazonInternal  <- Claude only
-#   claude (personal ALPHA)    333843746513  IibsAdminAccess        <- both
+#   codex profile        GPT + Claude   <- the GPT-provisioned account
+#   claude-code profile  Claude only    <- denied CreateInference on Mantle
+#   personal profile     GPT + Claude   <- bills the user personally
 #
-# ``codex-DO-NOT-DELETE`` is the account Amazon provisions specifically for the
+# The codex profile is the account Amazon provisions specifically for the
 # internal GPT models, so it is the correct default here — it keeps GPT traffic
 # on the purpose-built account instead of billing the user's personal one.
 # It is auto-refreshing (credential_process shells out to the codex wrapper),
 # so it needs no manual `ada credentials update`.
 #
 # Not simply the botocore default chain: the sibling ``bedrock`` plugin FORCES
-# ``AWS_PROFILE=claude-code-DO-NOT-DELETE`` at import time, and that role is
-# denied on Mantle (bedrock-mantle:CreateInference -> access_denied). Deferring
-# to the ambient value would therefore break whenever both plugins load.
+# its own profile at import time, and that role is denied on Mantle
+# (bedrock-mantle:CreateInference -> access_denied). Deferring to the ambient
+# value would therefore break whenever both plugins load.
 DEFAULT_AWS_PROFILE = "codex-DO-NOT-DELETE"
 AWS_PROFILE = os.environ.get("HERMES_MANTLE_AWS_PROFILE") or DEFAULT_AWS_PROFILE
 
@@ -129,9 +129,9 @@ _PROXY = MantleProxy(
 )
 
 # ── Personal-account path ───────────────────────────────────────────────────
-# The personal ALPHA account (``claude``, 333843746513, IibsAdminAccess) is also
-# entitled to Mantle GPT — verified 2026-08-06, a real /openai/v1/responses call
-# on openai.gpt-5.6-luna returns HTTP 200 status=completed under that profile.
+# The personal profile is also entitled to Mantle GPT — verified 2026-08-06, a
+# real /openai/v1/responses call on openai.gpt-5.6-luna returns HTTP 200
+# status=completed under that profile.
 #
 # It needs its OWN proxy instance rather than reusing _PROXY: MantleProxy caches
 # one botocore session per instance (``_creds_session``), so a single listener
@@ -241,7 +241,7 @@ register_provider(mantle)
 mantle_personal = BedrockMantleProfile(
     name="bedrock-mantle-personal",
     aliases=("mantle-personal", "gpt-personal", "my-mantle"),
-    display_name="Bedrock: Personal GPT (my ALPHA acct)",
+    display_name="Bedrock: Personal GPT (my own acct)",
     description=(
         f"GPT-5.6 Sol/Luna/Terra (~1M context) on Bedrock Mantle {REGION} via my "
         "own account — billed to me; use when the codex account is throttled"

@@ -2,8 +2,8 @@ name: bedrock
 kind: model-provider
 version: 1.0.0
 description: >
-  AWS Bedrock via the Amazon-internal claude-code role (CeceliaAmazonInternal,
-  account 175342148895, us-west-2). IAM auth — no API key. Overrides the bundled
-  bedrock profile to fix the region and force the claude-cli User-Agent the
-  role's aws:UserAgent IAM condition requires for streaming.
+  AWS Bedrock via the Amazon-internal claude-code role (us-west-2). IAM auth —
+  no API key. Overrides the bundled bedrock profile to fix the region and force
+  the claude-cli User-Agent the role's aws:UserAgent IAM condition requires for
+  streaming.
 author: samfp

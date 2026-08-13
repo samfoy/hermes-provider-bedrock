@@ -5,7 +5,12 @@ Runs against a stub upstream on loopback — no AWS credentials, no network, no
 real Mantle calls. Covers the behaviours that actually broke during
 development, so they cannot regress silently.
 
-Run:  python3 test_proxy.py
+Run:  python -m pytest test_proxy.py -q
+
+This is a real pytest module. It previously used a hand-rolled ``check()``
+helper driven from ``main()``, which meant ``pytest`` collected **zero** tests
+and reported success while running nothing — a CI job wired to pytest was green
+against untested code. Every assertion below is a collected test.
 """
 
 from __future__ import annotations
@@ -19,22 +24,20 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import pytest
+
 _spec = importlib.util.spec_from_file_location(
     "mantle_proxy_under_test", Path(__file__).resolve().parent / "proxy.py"
 )
 mp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mp)
 
-FAILURES: list[str] = []
-
 # Stands in for the plugin's MANTLE_MODELS without importing the plugin.
 STUB_MODELS = ("openai.gpt-5.6-sol", "openai.gpt-5.6-luna", "openai.gpt-5.6-terra")
 
-
-def check(cond: bool, label: str) -> None:
-    print(f"  {'PASS' if cond else 'FAIL'}  {label}")
-    if not cond:
-        FAILURES.append(label)
+# The exact canonical header set Mantle's SigV4 signature covers. Forwarding any
+# extra client header (accept, user-agent) breaks the signature with a 401.
+EXPECTED_SIGNED_HEADERS = "content-type;host;x-amz-date;x-amz-security-token"
 
 
 # ── Stub upstream standing in for bedrock-mantle ────────────────────────────
@@ -120,14 +123,12 @@ class FakeCreds:
     token = "FAKESESSIONTOKEN"
 
 
-def build_proxy(stub_port: int) -> mp.MantleProxy:
+def build_proxy(stub_port: int) -> "mp.MantleProxy":
     """A MantleProxy pointed at the stub, with signing stubbed out."""
     proxy = mp.MantleProxy(region="us-east-2", models=STUB_MODELS)
     proxy._get_frozen_credentials = lambda: FakeCreds()  # type: ignore[assignment]
     # Redirect upstream to the stub: plain HTTP on loopback.
     mp.UPSTREAM_HOST_TMPL = f"127.0.0.1:{stub_port}"
-
-    orig = proxy._sign_and_forward
 
     def http_forward(method, upstream_path, body, inbound_headers):
         from botocore.auth import SigV4Auth
@@ -149,8 +150,29 @@ def build_proxy(stub_port: int) -> mp.MantleProxy:
         return urllib.request.urlopen(req, timeout=30)
 
     proxy._sign_and_forward = http_forward  # type: ignore[assignment]
-    _ = orig
     return proxy
+
+
+@pytest.fixture
+def stub():
+    up = StubUpstream()
+    up.start()
+    try:
+        yield up
+    finally:
+        up.stop()
+
+
+@pytest.fixture
+def proxy(stub):
+    p = build_proxy(stub.port)
+    # start() explicitly: `port` is None until the listener exists, and several
+    # tests address the proxy by port rather than through base_url().
+    p.start()
+    try:
+        yield p
+    finally:
+        p.stop()
 
 
 def post(base: str, payload: dict, extra_headers: dict | None = None, raw=False):
@@ -178,156 +200,178 @@ def get(url: str):
         return resp.status, raw
 
 
-def main() -> int:
-    stub = StubUpstream()
-    stub_port = stub.start()
-    proxy = build_proxy(stub_port)
-    base = proxy.base_url()
+def signed_headers_of(auth_header: str) -> str:
+    for part in auth_header.split():
+        if part.startswith("SignedHeaders="):
+            return part.split("=", 1)[1].rstrip(",")
+    return ""
 
+
+# ── Request translation ─────────────────────────────────────────────────────
+def test_path_rewritten_to_openai_prefix(proxy, stub):
+    """Mantle serves the Responses API under /openai/v1, not /v1."""
+    post(proxy.base_url(), {"model": "openai.gpt-5.6-sol", "input": "hi"})
+    assert stub.last_path == "/openai/v1/responses"
+
+
+def test_body_forwarded_byte_for_byte(proxy, stub):
+    payload = {"model": "openai.gpt-5.6-luna", "input": "exact-body-check",
+               "max_output_tokens": 123}
+    post(proxy.base_url(), payload)
+    assert json.loads(stub.last_body) == payload
+
+
+# ── Header hygiene: the SigV4 401 regression ───────────────────────────────
+# SigV4 signs a canonical header list. Forwarding extra client headers, or
+# sending both `Content-Type` and `content-type`, makes the signature cover
+# headers the service did not expect and every call 401s.
+NOISY_CLIENT_HEADERS = {
+    "Authorization": "Bearer placeholder-must-be-dropped",
+    "Accept": "application/json",
+    "User-Agent": "OpenAI/Python 1.99",
+    "Accept-Encoding": "gzip",
+}
+
+
+def test_client_bearer_replaced_by_sigv4(proxy, stub):
+    post(proxy.base_url(), {"model": "x", "input": "y"},
+         extra_headers=NOISY_CLIENT_HEADERS)
+    auth = (stub.last_headers or {}).get("authorization", "")
+    assert auth.startswith("AWS4-HMAC-SHA256")
+    assert "placeholder-must-be-dropped" not in auth
+
+
+def test_signed_headers_are_the_minimal_fixed_set(proxy, stub):
+    post(proxy.base_url(), {"model": "x", "input": "y"},
+         extra_headers=NOISY_CLIENT_HEADERS)
+    auth = (stub.last_headers or {}).get("authorization", "")
+    assert signed_headers_of(auth) == EXPECTED_SIGNED_HEADERS
+
+
+@pytest.mark.parametrize("leaked", ["accept", "user-agent", "accept-encoding"])
+def test_client_headers_excluded_from_signature(proxy, stub, leaked):
+    post(proxy.base_url(), {"model": "x", "input": "y"},
+         extra_headers=NOISY_CLIENT_HEADERS)
+    auth = (stub.last_headers or {}).get("authorization", "")
+    assert leaked not in signed_headers_of(auth)
+
+
+def test_client_user_agent_not_forwarded(proxy, stub):
+    post(proxy.base_url(), {"model": "x", "input": "y"},
+         extra_headers=NOISY_CLIENT_HEADERS)
+    ua = ((stub.last_headers or {}).get("user-agent") or "").lower()
+    assert "openai/python" not in ua
+
+
+# ── Response relay ─────────────────────────────────────────────────────────
+def test_streaming_deltas_relayed_intact(proxy, stub):
+    stub.mode = "stream"
+    resp = post(proxy.base_url(),
+                {"model": "openai.gpt-5.6-sol", "input": "count", "stream": True},
+                raw=True)
+    deltas = []
+    for line in resp:
+        s = line.decode(errors="replace").strip()
+        if s.startswith("data:") and "[DONE]" not in s:
+            try:
+                deltas.append(json.loads(s[5:].strip()).get("delta", ""))
+            except Exception:
+                pass
+    assert "".join(deltas) == "one two three"
+
+
+def test_upstream_error_relayed_verbatim(proxy, stub):
+    """A 400 must not be masked as a 502: the message names the real problem."""
+    stub.mode = "error"
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        post(proxy.base_url(), {"model": "openai.gpt-5.6-sol", "input": "too big"})
+    assert exc.value.code == 400
+    assert "exceed model maximum" in exc.value.read().decode()
+
+
+def test_unknown_post_path_returns_404(proxy):
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(urllib.request.Request(
+            f"http://127.0.0.1:{proxy.port}/bogus",
+            data=b"{}", headers={"Content-Type": "application/json"}), timeout=15)
+    assert exc.value.code == 404
+
+
+# ── Listener ───────────────────────────────────────────────────────────────
+def test_proxy_binds_loopback_only(proxy):
+    """A bearer-carrying signer must never be reachable off-host."""
+    assert proxy._server.server_address[0] == "127.0.0.1"
+
+
+def test_start_is_idempotent(proxy):
+    assert proxy.start() == proxy.port
+
+
+# ── GET /v1/models: the WebUI Test-button 501 regression ───────────────────
+# BaseHTTPRequestHandler answers an unimplemented verb with 501, so before
+# do_GET existed the WebUI Custom Endpoints probe of {base_url}/models reported
+# "Endpoint returned HTTP 501." on a fully working provider. The catalog is
+# served locally on purpose: upstream ListModels is denied on the codex profile.
+def test_get_models_returns_200_not_501(proxy):
+    code, _ = get(f"http://127.0.0.1:{proxy.port}/v1/models")
+    assert code == 200
+
+
+def test_get_models_returns_the_curated_catalog(proxy):
+    _, payload = get(f"http://127.0.0.1:{proxy.port}/v1/models")
+    assert isinstance(payload, dict)
+    assert payload.get("object") == "list"
+    assert [m.get("id") for m in payload.get("data", [])] == list(STUB_MODELS)
+
+
+def test_catalog_never_forwarded_upstream(proxy, stub):
+    """ListModels is denied, so a forwarded probe would 401 on a working account."""
+    stub.last_path = None
+    get(f"http://127.0.0.1:{proxy.port}/v1/models")
+    assert stub.last_path is None
+
+
+@pytest.mark.parametrize("path,expected", [
+    ("/v1/models", 200),
+    ("/v1/models/", 200),          # trailing slash
+    ("/v1/models?limit=5", 200),   # query string
+    ("/v1", 200),                  # health
+    ("/nope", 404),                # unknown GET path, not 501
+])
+def test_get_routing(proxy, path, expected):
+    code, _ = get(f"http://127.0.0.1:{proxy.port}{path}")
+    assert code == expected
+
+
+def test_get_never_reaches_the_signer(proxy):
+    """A GET must not consume AWS credentials; only POST is signed."""
+    calls = {"n": 0}
+    real = proxy._sign_and_forward
+
+    def counting(*a, **kw):
+        calls["n"] += 1
+        return real(*a, **kw)
+
+    proxy._sign_and_forward = counting  # type: ignore[assignment]
     try:
-        print("\n[1] path rewrite /v1/responses -> /openai/v1/responses")
-        post(base, {"model": "openai.gpt-5.6-sol", "input": "hi"})
-        check(stub.last_path == "/openai/v1/responses",
-              f"upstream path is /openai/v1/responses (got {stub.last_path})")
-
-        print("\n[2] body forwarded byte-for-byte")
-        payload = {"model": "openai.gpt-5.6-luna", "input": "exact-body-check",
-                   "max_output_tokens": 123}
-        post(base, payload)
-        check(json.loads(stub.last_body) == payload, "upstream body matches request")
-
-        print("\n[3] header hygiene — the SigV4 401 regression")
-        post(base, {"model": "x", "input": "y"}, extra_headers={
-            "Authorization": "Bearer placeholder-must-be-dropped",
-            "Accept": "application/json",
-            "User-Agent": "OpenAI/Python 1.99",
-            "Accept-Encoding": "gzip",
-        })
-        h = stub.last_headers or {}
-        auth = h.get("authorization", "")
-        check(auth.startswith("AWS4-HMAC-SHA256"),
-              "Authorization replaced by SigV4 (client bearer discarded)")
-        check("placeholder-must-be-dropped" not in auth,
-              "client bearer never forwarded upstream")
-        signed = ""
-        for part in auth.split():
-            if part.startswith("SignedHeaders="):
-                signed = part.split("=", 1)[1].rstrip(",")
-        check(signed == "content-type;host;x-amz-date;x-amz-security-token",
-              f"SignedHeaders is the minimal fixed set (got {signed!r})")
-        for leaked in ("accept", "user-agent", "accept-encoding"):
-            check(leaked not in signed, f"{leaked} not in SignedHeaders")
-        check("openai/python" not in (h.get("user-agent") or "").lower(),
-              "client User-Agent not forwarded")
-
-        print("\n[4] streaming relayed intact")
-        stub.mode = "stream"
-        resp = post(base, {"model": "openai.gpt-5.6-sol", "input": "count",
-                           "stream": True}, raw=True)
-        deltas = []
-        for line in resp:
-            s = line.decode(errors="replace").strip()
-            if s.startswith("data:") and "[DONE]" not in s:
-                try:
-                    deltas.append(json.loads(s[5:].strip()).get("delta", ""))
-                except Exception:
-                    pass
-        check("".join(deltas) == "one two three",
-              f"SSE deltas reassemble exactly (got {''.join(deltas)!r})")
-
-        print("\n[5] upstream error relayed verbatim, not masked as 502")
-        stub.mode = "error"
-        code, body = None, ""
-        try:
-            post(base, {"model": "openai.gpt-5.6-sol", "input": "too big"})
-        except urllib.error.HTTPError as e:
-            code, body = e.code, e.read().decode()
-        check(code == 400, f"status preserved (got {code})")
-        check("exceed model maximum" in body, "upstream error body preserved")
-
-        print("\n[6] unknown path rejected")
-        stub.mode = "json"
-        code = None
-        try:
-            urllib.request.urlopen(urllib.request.Request(
-                f"http://127.0.0.1:{proxy.port}/bogus",
-                data=b"{}", headers={"Content-Type": "application/json"}), timeout=15)
-        except urllib.error.HTTPError as e:
-            code = e.code
-        check(code == 404, f"unsupported path returns 404 (got {code})")
-
-        print("\n[7] loopback binding only")
-        check(proxy._server.server_address[0] == "127.0.0.1",
-              "proxy bound to 127.0.0.1")
-
-        print("\n[8] start() is idempotent")
-        check(proxy.start() == proxy.port, "repeated start() reuses one listener")
-
-        print("\n[9] GET /v1/models — the WebUI Test-button 501 regression")
-        # BaseHTTPRequestHandler answers an unimplemented verb with 501, so
-        # before do_GET existed the WebUI Custom Endpoints probe of
-        # {base_url}/models reported "Endpoint returned HTTP 501." on a fully
-        # working provider. The catalog is served locally on purpose: upstream
-        # ListModels is denied on the codex account.
-        stub.last_path = None
-        code, payload = get(f"http://127.0.0.1:{proxy.port}/v1/models")
-        check(code == 200, f"GET /v1/models returns 200, not 501 (got {code})")
-        ids = [m.get("id") for m in payload.get("data", [])] if isinstance(payload, dict) else []
-        check(ids == list(STUB_MODELS), f"catalog matches the curated list (got {ids})")
-        check(isinstance(payload, dict) and payload.get("object") == "list",
-              "response uses the OpenAI /v1/models envelope")
-        check(stub.last_path is None,
-              "catalog served locally — never forwarded upstream (ListModels is denied)")
-
-        print("\n[10] GET trailing slash and query string tolerated")
-        code, _ = get(f"http://127.0.0.1:{proxy.port}/v1/models/")
-        check(code == 200, f"trailing slash still 200 (got {code})")
-        code, _ = get(f"http://127.0.0.1:{proxy.port}/v1/models?limit=5")
-        check(code == 200, f"query string still 200 (got {code})")
-        code, _ = get(f"http://127.0.0.1:{proxy.port}/v1")
-        check(code == 200, f"GET /v1 health returns 200 (got {code})")
-        code, _ = get(f"http://127.0.0.1:{proxy.port}/nope")
-        check(code == 404, f"unknown GET path returns 404, not 501 (got {code})")
-
-        print("\n[11] GET never reaches the signer")
-        # A GET must not consume AWS credentials; only POST is signed.
-        calls = {"n": 0}
-        real = proxy._sign_and_forward
-
-        def counting(*a, **kw):
-            calls["n"] += 1
-            return real(*a, **kw)
-
-        proxy._sign_and_forward = counting  # type: ignore[assignment]
         get(f"http://127.0.0.1:{proxy.port}/v1/models")
-        check(calls["n"] == 0, f"GET did not invoke _sign_and_forward (got {calls['n']})")
-        proxy._sign_and_forward = real  # type: ignore[assignment]
-
-        print("\n[12] two proxies keep separate credential sessions")
-        # The codex and personal providers share this class but MUST NOT share a
-        # botocore session, or whichever signed first would bill both accounts.
-        a = mp.MantleProxy(region="us-east-2", profile="profile-a")
-        b = mp.MantleProxy(region="us-east-2", profile="profile-b")
-        check(a.profile != b.profile, "each instance keeps its own profile")
-        check(a._creds_session is None and b._creds_session is None,
-              "credential sessions are per-instance, not class-level")
-        a._creds_session = object()
-        check(b._creds_session is None,
-              "setting one instance's session does not leak to the other")
-
     finally:
-        proxy.stop()
-        stub.stop()
+        proxy._sign_and_forward = real  # type: ignore[assignment]
+    assert calls["n"] == 0
 
-    print("\n" + "=" * 56)
-    if FAILURES:
-        print(f"FAILED ({len(FAILURES)}):")
-        for f in FAILURES:
-            print("  -", f)
-        return 1
-    print("All proxy tests passed.")
-    return 0
+
+# ── Per-instance credential isolation ──────────────────────────────────────
+def test_each_proxy_keeps_its_own_credential_session():
+    """The codex and personal providers share this class but MUST NOT share a
+    botocore session, or whichever signed first would bill both accounts."""
+    a = mp.MantleProxy(region="us-east-2", profile="profile-a")
+    b = mp.MantleProxy(region="us-east-2", profile="profile-b")
+    assert a.profile != b.profile
+    assert a._creds_session is None and b._creds_session is None
+
+    a._creds_session = object()
+    assert b._creds_session is None, "setting one session must not leak to the other"
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(pytest.main([__file__, "-q"]))

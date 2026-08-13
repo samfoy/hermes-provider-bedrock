@@ -2,9 +2,9 @@ name: bedrock-personal
 kind: model-provider
 version: 1.0.0
 description: >
-  Claude on Bedrock via Sam's PERSONAL ALPHA account (333843746513, role
-  IibsAdminAccess-DO-NOT-DELETE). Pinned to us-east-1 so its boto3 client
-  cannot share the region-keyed client cache with the internal claude-code
-  provider on us-west-2. Use when the internal accounts are throttled or
-  denied; note this bills the personal account.
+  Claude on Bedrock via a personal AWS account rather than an Amazon-internal
+  one. Pinned to us-east-1 so its boto3 client cannot share the region-keyed
+  client cache with the internal claude-code provider on us-west-2. Use when the
+  internal accounts are throttled or denied; note this bills the personal
+  account.
 author: samfp

@@ -9,7 +9,7 @@ Two things the bundled profile can't do on its own:
 1. **Region.** The bundled profile pins ``bedrock-runtime.us-east-1``. Hermes
    derives the Bedrock region by regexing the base_url
    (``agent/agent_init.py``), so the URL itself has to name ``us-west-2`` —
-   that's where the ``CeceliaAmazonInternal`` role has model access.
+   that's where the claude-code role has model access.
 
 2. **User-Agent.** The role's IAM policy carries an ``aws:UserAgent`` condition
    that gates streaming. Empirically (4 trials against this account):
@@ -49,9 +49,8 @@ logger = logging.getLogger(__name__)
 REGION = "us-west-2"
 BASE_URL = f"https://bedrock-runtime.{REGION}.amazonaws.com"
 
-# Provisioned by `toolbox install claude-code` (account 175342148895,
-# role CeceliaAmazonInternal). HERMES_BEDROCK_PROFILE overrides for anyone
-# pointing Hermes at a different Bedrock account.
+# Provisioned by `toolbox install claude-code`. HERMES_BEDROCK_PROFILE overrides
+# for anyone pointing Hermes at a different Bedrock account.
 DEFAULT_AWS_PROFILE = "claude-code-DO-NOT-DELETE"
 AWS_PROFILE = os.environ.get("HERMES_BEDROCK_PROFILE") or DEFAULT_AWS_PROFILE
 
@@ -65,10 +64,13 @@ _PATCHED_SERVICES = frozenset({"bedrock-runtime", "bedrock"})
 _PENDING_IMPORT_PATCHES: dict = {}
 
 # Verified invokable by this role on both converse and converse_stream.
-# Sourced from the shared account map so all three Bedrock providers agree on
-# one Claude catalog: the LATEST release per family only (opus / sonnet / fable
-# / haiku). `global.*` ids are deliberately excluded — every one duplicates a
-# `us.*` entry and doubled the picker length for no added capability.
+# Model ids come from live discovery (see _filter_discovery_to_us_anthropic),
+# reduced to the LATEST release per family and ordered by capability tier. The
+# seed below is only a fallback for a failed discovery call, so it names long-
+# public models rather than whatever this account is currently entitled to — a
+# newly entitled model still reaches the picker through discovery.
+# `global.*` ids are deliberately excluded — every one duplicates a `us.*` entry
+# and doubled the picker length for no added capability.
 _acct = None
 try:
     import importlib.util as _ilu
@@ -78,12 +80,11 @@ try:
     )
     _acct = _ilu.module_from_spec(_acct_spec)
     _acct_spec.loader.exec_module(_acct)
-    FALLBACK_MODELS = list(_acct.CLAUDE_MODELS)
+    FALLBACK_MODELS = list(_acct.CLAUDE_SEED_MODELS)
 except Exception:  # pragma: no cover — never break startup on a helper import
     FALLBACK_MODELS = [
-        "us.anthropic.claude-opus-5",
-        "us.anthropic.claude-sonnet-5",
-        "us.anthropic.claude-fable-5",
+        "us.anthropic.claude-opus-4-1-20250805-v1:0",
+        "us.anthropic.claude-sonnet-4-20250514-v1:0",
         "us.anthropic.claude-haiku-4-5-20251001-v1:0",
     ]
 
@@ -269,7 +270,7 @@ def _force_converse_api(mod) -> None:
 
     Hermes runs Claude-on-Bedrock through the ``AnthropicBedrock`` SDK
     (``anthropic_messages`` api_mode), which calls
-    ``InvokeModelWithResponseStream``. The ``CeceliaAmazonInternal`` role has NO
+    ``InvokeModelWithResponseStream``. The claude-code role has NO
     identity-based policy for that action — it is a hard IAM deny, not a
     User-Agent condition, so no header trick recovers it:
 
@@ -368,20 +369,26 @@ def _filter_discovery_to_us_anthropic(mod) -> None:
         if not filtered:
             # Non-US region (eu.*/ap.*) — better a full list than none.
             return models
-        # Collapse to the newest release per family (opus/sonnet/fable/haiku),
-        # so the picker shows 4 current models instead of 13 generations.
-        # Applied to DISCOVERED ids, not the static list, so a newly entitled
-        # `claude-opus-6` is surfaced with no code change.
+        # Collapse to the newest release per family so the picker shows the
+        # current models instead of every generation ever entitled, ordered by
+        # capability tier. Applied to DISCOVERED ids, so a newly entitled model
+        # is surfaced and ranked with no code change and without naming it here.
         try:
             if _acct is not None:
-                keep = set(_acct.latest_per_family([m.get("id", "") for m in filtered]))
-                reduced = [m for m in filtered if m.get("id") in keep]
+                ordered = _acct.latest_per_family([m.get("id", "") for m in filtered])
+                rank = {mid: i for i, mid in enumerate(ordered)}
+                reduced = [m for m in filtered if m.get("id") in rank]
                 if reduced:
-                    filtered = reduced
+                    # Keep latest_per_family's capability ordering, rather than
+                    # re-sorting against a static list: the seed list holds only
+                    # fallback ids, so sorting by it would leave discovered
+                    # models in arbitrary order.
+                    reduced.sort(key=lambda m: rank[m.get("id", "")])
+                    return reduced
         except Exception:
             logger.debug("bedrock: latest-per-family reduction failed", exc_info=True)
-        # Preserve the curated ordering from FALLBACK_MODELS (newest first),
-        # then append any discovered us.anthropic model not in that list.
+        # Reduction unavailable: fall back to the seed ordering, then anything
+        # discovered that the seed does not name.
         order = {mid: i for i, mid in enumerate(FALLBACK_MODELS)}
         filtered.sort(key=lambda m: order.get(m.get("id", ""), len(order)))
         return filtered
@@ -423,7 +430,7 @@ bedrock = ClaudeCodeBedrockProfile(
     name="bedrock",
     aliases=("aws", "aws-bedrock", "amazon-bedrock", "amazon", "claude-code", "amazon-claude-code"),
     display_name="Bedrock: Internal Claude (claude-code acct)",
-    description=f"Claude on Bedrock via the internal claude-code role ({REGION}, acct 175342148895, IAM auth — no API key)",
+    description=f"Claude on Bedrock via the internal claude-code role ({REGION}, IAM auth — no API key)",
     api_mode="bedrock_converse",
     env_vars=(),  # AWS SDK credential chain, not env-var keys
     base_url=BASE_URL,
