@@ -9,12 +9,16 @@ account module they import.
 
 ## Contents
 
-| Path | Provider | Model family | Auth |
+| Path | Provider(s) | Model family | Auth |
 |---|---|---|---|
 | `bedrock/` | `bedrock` | Claude (Converse API) | corp claude-code role, IAM |
 | `bedrock-personal/` | `bedrock-personal` | Claude (Converse API) | personal account, IAM |
-| `bedrock-mantle/` | `bedrock-mantle` | GPT-5.6 Sol/Luna/Terra (Responses API) | SigV4, no API key |
+| `bedrock-mantle/` | `bedrock-mantle`, `bedrock-mantle-personal` | GPT-5.6 Sol/Luna/Terra (Responses API) | SigV4, no API key |
 | `_bedrock_accounts.py` | — | shared account/region/model map | — |
+
+Three directories register **four** providers: `bedrock-mantle/__init__.py`
+declares a second profile, `bedrock-mantle-personal`, that signs with the personal
+account instead of the corp codex one. There is no fourth directory to look for.
 
 `bedrock` and `bedrock-personal` are **separate implementations**, not one plugin
 with different settings. `bedrock` patches the Bedrock adapter, forces the
