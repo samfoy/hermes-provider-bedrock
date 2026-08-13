@@ -167,9 +167,88 @@ def _install_patch_when_boto3_arrives() -> None:
 
 _install_patch_when_boto3_arrives()
 
+# Discovered catalog, cached for the process. Provider discovery can be called
+# repeatedly while building the Settings payload, and each miss is a control-plane
+# round-trip.
+_discovered_cache: list[str] | None = None
+
+
+def _discover_claude_models() -> list[str]:
+    """List this account's Claude inference profiles, newest per family.
+
+    Returns ``[]`` on any failure — no credentials yet, ``ListInferenceProfiles``
+    denied, boto3 absent, wrong region. Callers fall back to the seed list.
+
+    Never raises and never blocks startup on a slow control plane: provider
+    discovery runs while the web server builds its provider list, so an exception
+    here would surface as a broken Settings page rather than a short catalog.
+    """
+    global _discovered_cache
+    if _discovered_cache is not None:
+        return list(_discovered_cache)
+
+    ids: list[str] = []
+    try:
+        import boto3
+        from botocore.config import Config
+
+        session = boto3.Session(profile_name=PROFILE, region_name=REGION)
+        client = session.client(
+            "bedrock",
+            region_name=REGION,
+            config=Config(connect_timeout=3, read_timeout=6, retries={"max_attempts": 2}),
+        )
+        paginator = client.get_paginator("list_inference_profiles")
+        for page in paginator.paginate():
+            for item in page.get("inferenceProfileSummaries") or []:
+                mid = item.get("inferenceProfileId") or ""
+                # us.* only: global.* duplicates every entry, and non-Anthropic
+                # profiles (Nova, embeddings, image models) cannot serve a turn.
+                if mid.startswith("us.anthropic."):
+                    ids.append(mid)
+    except Exception:
+        logger.debug("bedrock-personal: model discovery unavailable", exc_info=True)
+        return []
+
+    try:
+        reduced = _acct.latest_per_family(ids)
+    except Exception:
+        logger.debug("bedrock-personal: latest-per-family reduction failed", exc_info=True)
+        return []
+
+    if reduced:
+        _discovered_cache = list(reduced)
+    return list(reduced)
+
 
 class PersonalBedrockProfile(ProviderProfile):
     """Claude on Bedrock via a personal AWS account."""
+
+    @property
+    def fallback_models(self) -> tuple:
+        """Live discovered catalog, falling back to the curated seed.
+
+        A property rather than a static tuple because Hermes has two catalog
+        paths that do not agree: chat/CLI resolution calls ``fetch_models()``,
+        while the WebUI model picker reads this **attribute** directly. A static
+        tuple therefore showed the seed in the picker while chat could reach every
+        discovered model — a model you are entitled to, usable by ``-m <id>`` but
+        absent from the UI.
+
+        Must never raise: this is an attribute read on UI and startup paths.
+        """
+        try:
+            discovered = _discover_claude_models()
+            if discovered:
+                return tuple(discovered)
+        except Exception:
+            logger.debug("bedrock-personal: catalog unavailable for picker", exc_info=True)
+        return tuple(getattr(self, "_seed_models", ()) or MODELS)
+
+    @fallback_models.setter
+    def fallback_models(self, value) -> None:
+        # The dataclass __init__ assigns the seed here.
+        self._seed_models = tuple(value or ())
 
     def fetch_models(
         self,
@@ -178,12 +257,22 @@ class PersonalBedrockProfile(ProviderProfile):
         base_url: str | None = None,
         timeout: float = 8.0,
     ) -> list[str] | None:
-        """Return the verified static Claude catalog.
+        """Discover this account's Claude inference profiles, newest per family.
 
-        Skips ``ListInferenceProfiles`` so provider discovery never spends a
-        network round-trip (and cannot fail) during startup. The list is
-        identical on both Claude accounts, confirmed via the AWS CLI.
+        Discovery is live rather than static because a static list is exactly
+        what goes stale: the account gains a model and the picker never shows it.
+        ``latest_per_family`` reduces every generation ever entitled down to the
+        current release per family and orders them by capability, so no model id
+        has to be named in source.
+
+        Falls back to :data:`MODELS` when discovery cannot run (no credentials at
+        startup, ``ListInferenceProfiles`` denied, wrong region). The seed names
+        only long-public models, so the fallback is a usable picker rather than
+        an empty one — but it is a floor, not the intended catalog.
         """
+        discovered = _discover_claude_models()
+        if discovered:
+            return discovered
         return list(MODELS)
 
 

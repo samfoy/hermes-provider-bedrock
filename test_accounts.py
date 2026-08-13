@@ -164,6 +164,25 @@ def test_seed_models_are_parseable_and_public():
     assert acct.CLAUDE_MODELS is acct.CLAUDE_SEED_MODELS  # back-compat alias
 
 
+def test_seed_is_a_floor_not_a_catalog():
+    """The seed must never be mistaken for the real catalog.
+
+    A provider whose ``fetch_models`` returned the seed verbatim would DOWNGRADE
+    the picker after this refactor: the seed deliberately names older public
+    models, so any provider using it must attempt discovery first and treat the
+    seed only as a fallback. Guards that intent by asserting the seed is strictly
+    weaker than what a current account discovers.
+    """
+    current = acct.latest_per_family([
+        "us.anthropic.claude-opus-5",
+        "us.anthropic.claude-sonnet-5",
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    ])
+    assert acct.CLAUDE_SEED_MODELS != current
+    seed_opus = [m for m in acct.CLAUDE_SEED_MODELS if "opus" in m]
+    assert seed_opus and seed_opus[0] < "us.anthropic.claude-opus-5"
+
+
 # ── Profile / region wiring ────────────────────────────────────────────────
 @pytest.mark.parametrize("provider", ["bedrock", "bedrock-personal", "bedrock-mantle"])
 def test_each_provider_gets_a_complete_env_override(provider):
