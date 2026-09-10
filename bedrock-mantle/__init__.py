@@ -42,9 +42,17 @@ claim below is a real ``/openai/v1/responses`` call, not a catalog reading:
   cap is on the TOTAL. Proof: at ``max_output_tokens=60000``, two requests with
   inputs 6,000 tokens apart both stopped at ``total_tokens=921,858`` exactly,
   with ``status=incomplete`` / ``reason=max_output_tokens`` — output shrank from
-  836 to 6,836 tokens to absorb the difference. With ``context_length=1,050,000``
-  Hermes computes an effective input budget of exactly 922,000, matching the
-  measured boundary.
+  836 to 6,836 tokens to absorb the difference. A 917,007-token input was
+  accepted at both ``max_output_tokens=16`` and ``128,000``, which shows the
+  input ceiling does not move with the output budget. With
+  ``context_length=1,050,000`` Hermes computes an effective input budget of
+  exactly 922,000, matching the measured boundary.
+
+  Do NOT publish 900,000 here, which an earlier version did. That number is the
+  measured INPUT limit, so Hermes subtracted the 128,000 output reserve a second
+  time and derived 772,000 — about 150,000 usable input tokens discarded. An even
+  earlier Mantle catalog published 1,000,000 as a drift margin below the real
+  ceiling; the code dropped that margin.
 * Astra accepts ``reasoning.effort`` low / medium / high / xhigh, and emits
   ``reasoning`` items carrying ``encrypted_content``. ``effort: "none"`` is
   rejected (HTTP 400).
