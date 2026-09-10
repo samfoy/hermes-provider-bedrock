@@ -1,10 +1,12 @@
 name: bedrock-mantle
 kind: model-provider
-version: 1.0.0
+version: 1.1.0
 description: >
   Amazon Bedrock Mantle via the OpenAI Responses API, authenticated with SigV4
   (no long-term API key). Adds the GPT-5.6 family (Sol / Luna / Terra, ~1M
-  context) which Mantle serves ONLY on /openai/v1/responses. A local
-  loopback proxy signs each request with SigV4, because Hermes' HTTP client
-  can only attach a static bearer token.
+  context) and GPT-6 Astra (900K context), which Mantle serves ONLY on
+  /openai/v1/responses. Local loopback proxies sign each request with SigV4,
+  because Hermes' HTTP client can only attach a static bearer token. One
+  listener per region and account: model availability and encrypted-reasoning
+  validity are both region-scoped.
 author: samfp

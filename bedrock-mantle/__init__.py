@@ -14,21 +14,54 @@ service (``bedrock-mantle.us-east-2.api.aws``) speaking the OpenAI Responses
 protocol. Overloading one profile would break Claude-on-Bedrock, so this
 registers under its own name and leaves ``bedrock`` untouched.
 
-Verified state of the world (2026-08-04, live probes against us-east-2)
-----------------------------------------------------------------------
-* ``/v1/models`` lists **49** models. There is **no plain ``openai.gpt-5.6``** —
-  5.6 ships as three named variants: ``-sol``, ``-luna``, ``-terra``.
-* All three return HTTP 200 ``status=completed`` on ``/openai/v1/responses``.
-* Context ceilings, from the service's own validation error on an oversized
-  prompt (``prompt tokens (1200011) exceed model maximum (N)``):
+Verified state of the world (2026-09-09, live probes against both regions)
+-------------------------------------------------------------------------
+Region availability is per MODEL. Both catalogs were read live, and every
+claim below is a real ``/openai/v1/responses`` call, not a catalog reading:
 
-      openai.gpt-5.6-sol / -luna / -terra ->  N = 1,050,000
-      openai.gpt-5.5    / gpt-5.4         ->  N =   278,528
+    us-east-2   gpt-5.6-sol, -luna, -terra          gpt-6-astra ABSENT (404)
+    us-west-2   gpt-6-astra, gpt-5.6-luna, -terra   gpt-5.6-sol ABSENT (404)
 
-  So the 1M context is real for 5.6 and specific to it. We publish 1,000,000
-  (under the true ceiling) so token-estimate drift cannot push a request over.
-* ``reasoning.effort: "xhigh"`` is accepted and echoed back.
-* Image input works via the ``source`` block form.
+* ``openai.gpt-6-astra`` returns HTTP 200 ``status=completed`` on us-west-2
+  under the PERSONAL profile only. The internal builder/codex account is
+  denied it by an explicit service control policy on
+  ``bedrock-mantle:CreateInference`` for ``project/default`` in us-west-2 —
+  an org policy, not a role gap, so it cannot be fixed from here.
+* Astra context: publish **1,050,000**, the TOTAL window. Do not publish the
+  input limit here. Hermes derives ``effective_window = context_length -
+  max_tokens`` itself (``agent/context_compressor._compute_threshold_tokens``),
+  so publishing the input limit subtracts the output reserve a second time.
+  Measured live, and corroborated by models.dev, which lists
+  ``context: 1050000 / input: 922000 / output: 128000``:
+
+      total window   1,050,000
+      input limit      922,000   <- binary-searched to 921,758..921,882
+      max output       128,000   (922,000 + 128,000 = 1,050,000)
+
+  The input limit does NOT move with requested ``max_output_tokens``, and the
+  cap is on the TOTAL. Proof: at ``max_output_tokens=60000``, two requests with
+  inputs 6,000 tokens apart both stopped at ``total_tokens=921,858`` exactly,
+  with ``status=incomplete`` / ``reason=max_output_tokens`` — output shrank from
+  836 to 6,836 tokens to absorb the difference. With ``context_length=1,050,000``
+  Hermes computes an effective input budget of exactly 922,000, matching the
+  measured boundary.
+* Astra accepts ``reasoning.effort`` low / medium / high / xhigh, and emits
+  ``reasoning`` items carrying ``encrypted_content``. ``effort: "none"`` is
+  rejected (HTTP 400).
+* Tool calling, SSE streaming, and image input all verified working on astra.
+  Vision needs the ``image_url`` data-URL form; the ``source`` block form is
+  accepted but silently ignored, so the model cannot see the image.
+* Encrypted reasoning is sealed **per region**, not per model. Measured:
+  astra(us-west-2) history replayed to gpt-5.6-luna(us-east-2) returns HTTP
+  400 "encrypted reasoning is scoped to the region that produced it and
+  cannot be replayed in a different region", while astra -> luna within
+  us-west-2 succeeds. Tampering with the blob returns "invalid encrypted
+  reasoning", which proves the service really validates it.
+
+Earlier verified facts (2026-08-04) that still hold
+---------------------------------------------------
+* Context ceilings from the service's own oversize validation error:
+  ``openai.gpt-5.6-*`` -> 1,050,000; ``gpt-5.5`` / ``gpt-5.4`` -> 278,528.
 * ``/v1/chat/completions`` returns HTTP 400 for 5.6 — Responses API only.
 """
 
@@ -93,22 +126,27 @@ except ValueError:
 
 # ── Model catalog ───────────────────────────────────────────────────────────
 # Context windows verified against the live endpoint; see module docstring.
-GPT_5_6_CONTEXT = 1_000_000     # true ceiling 1,050,000 — headroom on purpose
+GPT_5_6_CONTEXT = 1_050_000     # total window; input limit is 922,000 + 128,000 output
+GPT_6_ASTRA_CONTEXT = 1_050_000 # total window; input limit is 922,000 + 128,000 output
 GPT_5_X_CONTEXT = 272_000       # true ceiling 278,528
 MAX_OUTPUT_TOKENS = 128_000
 
 # Responses-API models, most capable first (drives picker order).
-# Latest generation only: 5.6 ships as three sibling variants (sol / luna /
-# terra) which are peers, not versions of each other, so all three stay. The
-# superseded 5.5 and 5.4 generations are omitted — they cap at 272K context
-# versus 5.6's ~1M, so there is no reason to pick them.
-MANTLE_MODELS = [
+#
+# Only the internal codex listener remains, and it serves us-east-2. Personal
+# GPT moved to `bedrock-personal` over native Converse.
+EAST_MODELS = [
     "openai.gpt-5.6-sol",
     "openai.gpt-5.6-luna",
     "openai.gpt-5.6-terra",
 ]
 
+# Kept as the historical name for the us-east-2 set: existing config, tests and
+# docs refer to MANTLE_MODELS, and that listener's catalog is unchanged.
+MANTLE_MODELS = EAST_MODELS
+
 MODEL_CONTEXT = {
+    "openai.gpt-6-astra": GPT_6_ASTRA_CONTEXT,
     "openai.gpt-5.6-sol": GPT_5_6_CONTEXT,
     "openai.gpt-5.6-luna": GPT_5_6_CONTEXT,
     "openai.gpt-5.6-terra": GPT_5_6_CONTEXT,
@@ -125,35 +163,18 @@ _PROXY = MantleProxy(
     # The proxy answers GET /v1/models itself with this catalog. Upstream
     # ListModels is denied on the codex account, so a forwarded probe 401s on
     # a working provider; see fetch_models below and proxy.do_GET.
-    models=tuple(MANTLE_MODELS),
+    models=tuple(EAST_MODELS),
+    model_context=MODEL_CONTEXT,
 )
 
 # ── Personal-account path ───────────────────────────────────────────────────
-# The personal profile is also entitled to Mantle GPT — verified 2026-08-06, a
-# real /openai/v1/responses call on openai.gpt-5.6-luna returns HTTP 200
-# status=completed under that profile.
+# ── Personal-account GPT moved to `bedrock-personal` ────────────────────────
+# The personal account reaches every GPT model over native bedrock-runtime
+# Converse, so it needs no proxy and no separate listener. Ports 8792 and 8793
+# are retired. `bedrock-personal` serves Claude and GPT from one provider.
 #
-# It needs its OWN proxy instance rather than reusing _PROXY: MantleProxy caches
-# one botocore session per instance (``_creds_session``), so a single listener
-# can only ever sign for one account. A second pinned port means each provider's
-# base_url names the listener holding the right credentials, and the codex path
-# is untouched.
-PERSONAL_AWS_PROFILE = (
-    os.environ.get("HERMES_MANTLE_PERSONAL_AWS_PROFILE") or "claude"
-)
-try:
-    PERSONAL_PROXY_PORT = int(
-        os.environ.get("HERMES_MANTLE_PERSONAL_PROXY_PORT") or 8792
-    )
-except ValueError:
-    PERSONAL_PROXY_PORT = 8792
-
-_PERSONAL_PROXY = MantleProxy(
-    region=REGION,
-    profile=PERSONAL_AWS_PROFILE,
-    pinned_port=PERSONAL_PROXY_PORT,
-    models=tuple(MANTLE_MODELS),
-)
+# Native Converse also removes the region split: us-east-1 serves astra, sol,
+# terra, and luna together, which a Mantle region cannot do.
 
 
 class BedrockMantleProfile(ProviderProfile):
@@ -166,20 +187,24 @@ class BedrockMantleProfile(ProviderProfile):
         base_url: str | None = None,
         timeout: float = 8.0,
     ) -> list[str] | None:
-        """Return the curated Responses-API model list.
+        """Return this provider's curated Responses-API model list.
 
-        Deliberately does NOT hit ``/v1/models``: that route lists every Mantle
-        model including Chat-Completions-only ones (DeepSeek, Qwen, Kimi, ...),
-        which this profile cannot serve in ``codex_responses`` mode. Listing
-        them would put models in the picker that 400 on first use.
+        Reads ``fallback_models`` so each registered provider reports its OWN
+        region's catalog. A hardcoded list here would advertise gpt-5.6-sol on
+        the us-west-2 provider, where it does not exist and 404s on first use.
+
+        Deliberately does NOT hit ``/v1/models`` upstream: that route lists
+        every Mantle model including Chat-Completions-only ones (DeepSeek, Qwen,
+        Kimi, ...), which this profile cannot serve in ``codex_responses`` mode.
+        Listing them would put models in the picker that 400 on first use.
 
         It also would not work on the default account. ``codex-DO-NOT-DELETE``
         is granted ``bedrock-mantle:CreateInference`` but DENIED
         ``bedrock-mantle:ListModels`` — inference succeeds while discovery
-        returns 401 ``access_denied``. A discovery-based catalog would
+        returns 403 ``access_denied``. A discovery-based catalog would
         therefore report zero models on a fully working account.
         """
-        return list(MANTLE_MODELS)
+        return list(self.fallback_models)
 
 
 def _resolve_base_url(proxy=None) -> str:
@@ -234,28 +259,3 @@ mantle = BedrockMantleProfile(
 )
 
 register_provider(mantle)
-
-# Same models and wire protocol, personal account's credentials. Registered as
-# a sibling provider so the picker can express which account GPT traffic bills
-# to, mirroring the Claude split between ``bedrock`` and ``bedrock-personal``.
-mantle_personal = BedrockMantleProfile(
-    name="bedrock-mantle-personal",
-    aliases=("mantle-personal", "gpt-personal", "my-mantle"),
-    display_name="Bedrock: Personal GPT (my own acct)",
-    description=(
-        f"GPT-5.6 Sol/Luna/Terra (~1M context) on Bedrock Mantle {REGION} via my "
-        "own account — billed to me; use when the codex account is throttled"
-    ),
-    api_mode="codex_responses",
-    env_vars=(),
-    base_url=_resolve_base_url(_PERSONAL_PROXY),
-    # See the note on `mantle` above: auth_type="api_key" only makes the catalog
-    # visible; real auth is SigV4 inside the proxy and no key is ever read.
-    auth_type="api_key",
-    fallback_models=tuple(MANTLE_MODELS),
-    supports_health_check=True,
-    supports_vision=True,
-    default_aux_model="openai.gpt-5.6-luna",
-)
-
-register_provider(mantle_personal)

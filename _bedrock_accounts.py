@@ -12,6 +12,12 @@ claude-code profile          Claude only           **denied**  yes
 personal profile             GPT + Claude          yes         yes
 ===========================  ====================  ==========  ======
 
+The personal profile reaches GPT over the native ``bedrock-runtime`` Converse
+API, so it needs no proxy and no separate provider. Verified 2026-09-09:
+``us-east-1`` and ``us-west-2`` each serve astra, sol, terra, and luna. The
+``us.`` inference-profile prefix is mandatory, because a bare ``openai.*`` id
+rejects with "on-demand throughput isn't supported".
+
 Account numbers are deliberately not recorded here. Each profile resolves to its
 own account through the local AWS config, and :func:`account_id_for_profile`
 reports it at runtime when a diagnostic needs it.
@@ -24,8 +30,7 @@ provider                    path                                credential
 ==========================  ==================================  ===================
 ``bedrock-mantle``          internal GPT (Responses API)        codex profile
 ``bedrock``                 internal Claude (Converse)          claude-code profile
-``bedrock-personal``        personal Claude (Converse)          personal profile
-``bedrock-mantle-personal`` personal GPT (Responses API)        personal profile
+``bedrock-personal``        personal Claude + GPT (Converse)    personal profile
 ==========================  ==================================  ===================
 
 The region-collision problem

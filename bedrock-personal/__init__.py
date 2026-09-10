@@ -65,6 +65,17 @@ BASE_URL = f"https://bedrock-runtime.{REGION}.amazonaws.com"
 # only backstops a failed discovery call, so it names long-public models.
 MODELS = list(_acct.CLAUDE_SEED_MODELS)
 
+# Native-Converse GPT ids. Discovery cannot supply these: `_discover_claude_models`
+# filters to `us.anthropic.*`, so every GPT id must be named here.
+# The `us.` prefix is mandatory — a bare `openai.*` id rejects with
+# "on-demand throughput isn't supported" and needs an inference profile.
+GPT_MODELS = [
+    "us.openai.gpt-6-astra",
+    "us.openai.gpt-5.6-sol",
+    "us.openai.gpt-5.6-terra",
+    "us.openai.gpt-5.6-luna",
+]
+
 
 def _install_region_scoped_profile_patch() -> bool:
     """Bind the personal AWS profile to Bedrock clients for THIS region only.
@@ -240,10 +251,10 @@ class PersonalBedrockProfile(ProviderProfile):
         try:
             discovered = _discover_claude_models()
             if discovered:
-                return tuple(discovered)
+                return tuple(list(discovered) + GPT_MODELS)
         except Exception:
             logger.debug("bedrock-personal: catalog unavailable for picker", exc_info=True)
-        return tuple(getattr(self, "_seed_models", ()) or MODELS)
+        return tuple(getattr(self, "_seed_models", ()) or (MODELS + GPT_MODELS))
 
     @fallback_models.setter
     def fallback_models(self, value) -> None:
@@ -272,16 +283,16 @@ class PersonalBedrockProfile(ProviderProfile):
         """
         discovered = _discover_claude_models()
         if discovered:
-            return discovered
-        return list(MODELS)
+            return list(discovered) + GPT_MODELS
+        return list(MODELS) + GPT_MODELS
 
 
 bedrock_personal = PersonalBedrockProfile(
     name="bedrock-personal",
     aliases=("bedrock-alpha", "claude-personal", "personal-bedrock", "my-bedrock"),
-    display_name="Bedrock: Personal Claude (my own acct)",
+    display_name="Bedrock: Personal Claude + GPT (my own acct)",
     description=(
-        f"Claude on Bedrock via my own AWS account ({REGION}, IAM auth) — "
+        f"Claude and GPT on Bedrock via my own AWS account ({REGION}, IAM auth) — "
         "billed to me; use when the internal accounts are throttled or denied"
     ),
     api_mode="bedrock_converse",
@@ -294,7 +305,7 @@ bedrock_personal = PersonalBedrockProfile(
     # provider, so the `if api_key:` guard is false and no live fetch happens —
     # real auth stays SigV4/boto3 against the personal profile.
     auth_type="api_key",
-    fallback_models=tuple(MODELS),
+    fallback_models=tuple(MODELS + GPT_MODELS),
     supports_health_check=False,   # bedrock-runtime has no /models route
     supports_vision=True,
     default_aux_model="us.anthropic.claude-haiku-4-5-20251001-v1:0",

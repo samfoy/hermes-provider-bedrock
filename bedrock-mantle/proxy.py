@@ -64,7 +64,19 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # ── Upstream ────────────────────────────────────────────────────────────────
-# GPT-5.6 and the other Responses-API models are served from us-east-2.
+# Region matters per MODEL, not just per account. Verified 2026-09-09 against
+# both live catalogs:
+#
+#   us-east-2  gpt-5.6-sol / -luna / -terra        NO gpt-6-astra
+#   us-west-2  gpt-6-astra, gpt-5.6-luna / -terra  NO gpt-5.6-sol
+#
+# So a single global region cannot serve both astra and sol. Each region gets
+# its own proxy instance, and the plugin routes a model to the right one.
+#
+# This split is also why the region belongs in the base_url: encrypted
+# reasoning is sealed PER REGION (the service rejects a cross-region replay
+# with "encrypted reasoning is scoped to the region that produced it"), and
+# Hermes' cross-issuer guard keys the issuer on base_url.
 DEFAULT_REGION = "us-east-2"
 UPSTREAM_HOST_TMPL = "bedrock-mantle.{region}.api.aws"
 
@@ -86,17 +98,48 @@ _HOP_BY_HOP = frozenset({
 })
 
 
+def _model_entry(model_id: str, context_window: Optional[int] = None) -> dict:
+    """One ``GET /v1/models`` entry, with the context window when known.
+
+    ``context_length`` is the key Hermes reads first
+    (``agent/model_metadata._CONTEXT_LENGTH_KEYS``). It is omitted rather than
+    guessed when the caller passes nothing, so an unknown model keeps the
+    core's own resolution path instead of inheriting a wrong number here.
+    """
+    entry = {"id": model_id, "object": "model", "owned_by": "bedrock-mantle"}
+    if context_window:
+        entry["context_length"] = int(context_window)
+    return entry
+
+
 class MantleProxy:
     """Loopback HTTP server that SigV4-signs and forwards to Bedrock Mantle."""
 
     def __init__(self, region: str = DEFAULT_REGION, profile: Optional[str] = None,
-                 pinned_port: int = 0, models: tuple = ()):
+                 pinned_port: int = 0, models: tuple = (),
+                 model_context: Optional[dict] = None):
         self.region = region
         self.profile = profile
         self.pinned_port = pinned_port
         # Curated model ids this listener advertises on ``GET /v1/models``.
         # Passed in by the plugin so the proxy stays free of a back-import.
         self.models = tuple(models)
+        # Optional ``{model_id: context_window}``. Advertised as
+        # ``context_length`` on ``GET /v1/models`` so Hermes reads the real
+        # window from the endpoint instead of guessing from the model name.
+        #
+        # This is load-bearing for any model the core name table does not
+        # know. ``agent/model_metadata.DEFAULT_CONTEXT_LENGTHS`` resolves by
+        # longest-substring match, so ``openai.gpt-6-astra`` matches NO key
+        # and falls back to ``CONTEXT_PROBE_TIERS[0]`` = 256,000 — against a
+        # real total window of 1,050,000. That silently discards 76% of the
+        # window and makes the compressor fire far too early.
+        #
+        # Publish the TOTAL window, never the input limit. Hermes subtracts the
+        # output reserve itself (``effective_window = context_length -
+        # max_tokens`` in agent/context_compressor), so an input-limit value
+        # here is discounted twice.
+        self.model_context = dict(model_context or {})
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._port: Optional[int] = None
@@ -248,13 +291,27 @@ class MantleProxy:
                         self._json(200, {
                             "object": "list",
                             "data": [
-                                {"id": mid, "object": "model", "owned_by": "bedrock-mantle"}
+                                _model_entry(mid, proxy.model_context.get(mid))
                                 for mid in proxy.models
                             ],
                         })
                         return
                     if path in ("", "/health", "/v1"):
-                        self._json(200, {"status": "ok", "service": "bedrock-mantle-proxy"})
+                        # Identify the region and profile, not just liveness.
+                        # A pinned port can be held by ANOTHER listener (a
+                        # second Hermes process, or a stale one from an earlier
+                        # config), and config.yaml names the port as static
+                        # text. Without this, a request signed for the wrong
+                        # region is indistinguishable from a correct one, and
+                        # the symptom is a confusing 404 "model does not exist"
+                        # rather than a wiring error.
+                        self._json(200, {
+                            "status": "ok",
+                            "service": "bedrock-mantle-proxy",
+                            "region": proxy.region,
+                            "profile": proxy.profile or "(default chain)",
+                            "models": list(proxy.models),
+                        })
                         return
                     self._fail(404, f"unsupported path {self.path!r}")
 
@@ -334,8 +391,19 @@ class MantleProxy:
                 try:
                     server = ThreadingHTTPServer(("127.0.0.1", self.pinned_port), Handler)
                 except OSError:
-                    logger.info(
-                        "bedrock-mantle: port %s unavailable, using an ephemeral port",
+                    # WARNING, not INFO: config.yaml pins this port as static
+                    # text, so an ephemeral fallback means Hermes keeps sending
+                    # to the INCUMBENT on the pinned port — which can be a
+                    # different region or a different AWS account. The symptom
+                    # is a 404 "model does not exist" that looks like a service
+                    # problem instead of a port collision. GET /health on the
+                    # pinned port reports the incumbent's region and profile.
+                    logger.warning(
+                        "bedrock-mantle: port %s is already in use (region=%s "
+                        "profile=%s); binding an ephemeral port instead. Any "
+                        "config.yaml base_url naming port %s now reaches the "
+                        "INCUMBENT listener, not this one.",
+                        self.pinned_port, self.region, self.profile,
                         self.pinned_port,
                     )
             if server is None:

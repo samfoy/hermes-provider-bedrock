@@ -373,5 +373,176 @@ def test_each_proxy_keeps_its_own_credential_session():
     assert b._creds_session is None, "setting one session must not leak to the other"
 
 
+# ── Context window advertised on GET /v1/models ────────────────────────────
+# Hermes resolves a context window by longest-substring match over
+# agent/model_metadata.DEFAULT_CONTEXT_LENGTHS. Measured 2026-09-09:
+# "openai.gpt-6-astra" matches NO key there and falls back to
+# CONTEXT_PROBE_TIERS[0] = 256,000, against a real total window of 1,050,000.
+# So the endpoint must advertise the window itself, or most of Astra's context
+# goes unused and the compressor fires far too early.
+#
+# The advertised number is the TOTAL window, never the input limit: Hermes
+# computes effective_window = context_length - max_tokens itself, so an
+# input-limit value would subtract the output reserve twice.
+def test_models_advertise_context_length_when_known():
+    proxy = mp.MantleProxy(
+        region="us-west-2",
+        models=("openai.gpt-6-astra",),
+        model_context={"openai.gpt-6-astra": 1_050_000},
+    )
+    try:
+        _, payload = get(f"http://127.0.0.1:{proxy.start()}/v1/models")
+        entry = payload["data"][0]
+        assert entry["id"] == "openai.gpt-6-astra"
+        assert entry["context_length"] == 1_050_000
+    finally:
+        proxy.stop()
+
+
+def test_context_length_key_is_one_hermes_reads():
+    """The key name is load-bearing, not cosmetic.
+
+    ``max_tokens`` would be read as max *output* tokens, not the window
+    (agent/model_metadata._MAX_COMPLETION_KEYS), so it must not be used here.
+    """
+    entry = mp._model_entry("m", 1_050_000)
+    assert "context_length" in entry
+    assert "max_tokens" not in entry
+
+
+# Regression guard for a real defect: Astra was first published at 900,000,
+# the measured INPUT ceiling, which cost ~150,000 tokens of usable input.
+# Hermes computes effective_window = context_length - max_tokens
+# (agent/context_compressor._compute_threshold_tokens), so publishing an input
+# limit subtracts the 128,000 output reserve twice.
+#
+# Measured live 2026-09-09 and corroborated by models.dev
+# (context 1050000 / input 922000 / output 128000): the cap is on the TOTAL.
+# Two requests whose inputs differed by 6,000 tokens both stopped at
+# total_tokens=921,858 with status=incomplete / reason=max_output_tokens.
+def test_advertised_window_is_total_not_input_limit():
+    total, max_output, measured_input_limit = 1_050_000, 128_000, 922_000
+    assert total - max_output == measured_input_limit, (
+        "advertise the TOTAL window: total minus the output reserve must equal "
+        "the input limit measured against the live service"
+    )
+    entry = mp._model_entry("openai.gpt-6-astra", total)
+    assert entry["context_length"] - max_output == measured_input_limit
+
+
+def test_unknown_model_omits_context_length():
+    """Absent metadata must stay absent, never become a guessed number.
+
+    Omitting the key leaves Hermes' own resolution path intact; emitting a
+    wrong value would override it with something worse than the fallback.
+    """
+    proxy = mp.MantleProxy(region="us-east-2", models=("some.new-model",))
+    try:
+        _, payload = get(f"http://127.0.0.1:{proxy.start()}/v1/models")
+        assert "context_length" not in payload["data"][0]
+    finally:
+        proxy.stop()
+
+
+def test_model_context_is_copied_not_shared():
+    """Two listeners share one MODEL_CONTEXT dict at the call site."""
+    shared = {"openai.gpt-6-astra": 1_050_000}
+    a = mp.MantleProxy(region="us-west-2", model_context=shared)
+    a.model_context["mutated"] = 1
+    assert "mutated" not in shared
+
+
+# ── Region isolation ───────────────────────────────────────────────────────
+# Availability is per model AND per region (verified live 2026-09-09):
+# gpt-5.6-sol exists only in us-east-2, gpt-6-astra only in us-west-2. A
+# listener that advertises the other region's model 404s on first use.
+def test_region_reaches_the_matching_upstream_host():
+    """Region must reach that region's host, so a per-region listener is real.
+
+    Uses a literal template rather than ``mp.UPSTREAM_HOST_TMPL``: ``build_proxy``
+    rebinds that module global to the loopback stub, so reading it here would
+    assert against whatever a previous test left behind.
+    """
+    east = mp.MantleProxy(region="us-east-2")
+    west = mp.MantleProxy(region="us-west-2")
+    assert east.region != west.region
+    assert "bedrock-mantle.{region}.api.aws".format(region=west.region) == (
+        "bedrock-mantle.us-west-2.api.aws"
+    )
+
+
+def test_distinct_ports_give_distinct_issuer_identities():
+    """Encrypted reasoning is sealed per region, so the base_url must differ.
+
+    Hermes stamps the reasoning issuer as ``other:{base_url}``
+    (agent/codex_responses_adapter._classify_responses_issuer) and drops foreign
+    blocks at replay. Two regions sharing one base_url would defeat that guard
+    and send us-east-2 reasoning to us-west-2, which the service rejects with
+    "encrypted reasoning is scoped to the region that produced it".
+    """
+    east = mp.MantleProxy(region="us-east-2", models=STUB_MODELS)
+    west = mp.MantleProxy(region="us-west-2", models=("openai.gpt-6-astra",))
+    try:
+        assert east.base_url() != west.base_url()
+    finally:
+        east.stop()
+        west.stop()
+
+
+# ── /health identifies the listener, not just liveness ─────────────────────
+# A pinned port can be held by another listener (a second Hermes process, or a
+# stale one). config.yaml names the port as static text, so the request would
+# reach the incumbent — possibly a different region or AWS account — and fail
+# with a 404 "model does not exist" that looks like a service outage.
+def test_health_reports_region_and_profile():
+    proxy = mp.MantleProxy(
+        region="us-west-2", profile="my-profile", models=("openai.gpt-6-astra",)
+    )
+    try:
+        _, payload = get(f"http://127.0.0.1:{proxy.start()}/health")
+        assert payload["region"] == "us-west-2"
+        assert payload["profile"] == "my-profile"
+        assert payload["models"] == ["openai.gpt-6-astra"]
+    finally:
+        proxy.stop()
+
+
+def test_health_distinguishes_two_regions():
+    """The whole point: two live listeners must be tellable apart."""
+    east = mp.MantleProxy(region="us-east-2", profile="p-east")
+    west = mp.MantleProxy(region="us-west-2", profile="p-west")
+    try:
+        _, pe = get(f"http://127.0.0.1:{east.start()}/health")
+        _, pw = get(f"http://127.0.0.1:{west.start()}/health")
+        assert pe["region"] != pw["region"]
+    finally:
+        east.stop()
+        west.stop()
+
+
+def test_pinned_port_collision_warns_and_still_serves():
+    """An ephemeral fallback must be loud, because config.yaml pins the port.
+
+    The incumbent keeps the pinned port, so Hermes would silently talk to the
+    wrong listener. The fallback must still produce a working server.
+    """
+    incumbent = mp.MantleProxy(region="us-east-2", models=STUB_MODELS)
+    port = incumbent.start()
+    contender = mp.MantleProxy(
+        region="us-west-2", pinned_port=port, models=("openai.gpt-6-astra",)
+    )
+    try:
+        got = contender.start()
+        assert got != port, "contender must not steal the incumbent's port"
+        # Each listener still answers for its own region.
+        _, pi = get(f"http://127.0.0.1:{port}/health")
+        _, pc = get(f"http://127.0.0.1:{got}/health")
+        assert pi["region"] == "us-east-2"
+        assert pc["region"] == "us-west-2"
+    finally:
+        incumbent.stop()
+        contender.stop()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
